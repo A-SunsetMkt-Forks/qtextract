@@ -5,12 +5,17 @@ use libflate::zlib;
 use filetime::{FileTime, set_file_times};
 use crate::binary_stream::BinaryReader;
 
+// notes to self:
+// https://github.com/sjkrb/Pchak/blob/main/qmlcache_loader.cpp
+// https://github.com/mburakov/qt5/blob/master/qtdeclarative/src/qml/compiler/qv4compileddata_p.h#L142
+// https://doc.qt.io/qt-6/qtqml-qtquick-compiler-tech.html
+
 pub enum QtNodeAux {
     Directory(Vec<QtNode>),
     Resource {
         locale: u32,
         is_compressed: bool,
-        file_offset: usize,
+        file_offset: u64,
         data: Vec<u8>
     }
 }
@@ -96,11 +101,11 @@ impl QtNode {
 
 #[derive(Default, Clone, Copy, Debug)]
 pub struct QtResourceInfo {
-    pub signature_id: i32,
-    pub registrar: usize,
-    pub data: usize,
-    pub name: usize,
-    pub tree: usize,
+    pub signature_tag: Option<&'static str>,
+    pub registrar: u64,
+    pub data: u64,
+    pub name: u64,
+    pub tree: u64,
     pub version: usize
 }
 
@@ -112,7 +117,7 @@ impl QtResourceInfo {
     }
 
     fn read_name(&self, buffer: &[u8], name_offset: i32) -> Option<(String, u32)> {
-        let mut stream = BinaryReader::new_at(buffer, self.name.wrapping_add_signed(name_offset as isize));
+        let mut stream = BinaryReader::new_at(buffer, self.name.wrapping_add_signed(name_offset.into()) as usize);
         let name_length = stream.read_u16::<true>()?;
         let name_hash = stream.read_u32::<true>()?;
         let name = stream.read_u16_string::<true>(name_length as usize)?;
@@ -120,7 +125,7 @@ impl QtResourceInfo {
     }
 
     fn read_data(&self, buffer: &[u8], data_offset: i32) -> Option<Vec<u8>> {
-        let mut stream = BinaryReader::new_at(buffer, self.data.wrapping_add_signed(data_offset as isize));
+        let mut stream = BinaryReader::new_at(buffer, self.data.wrapping_add_signed(data_offset.into()) as usize);
         let data_size = stream.read_u32::<true>()?;
         let data = stream.read_bytes(data_size as usize)?;
         Some(Vec::from(data))
@@ -152,9 +157,9 @@ impl QtResourceInfo {
 		14: int64 last_modified // version == 2 ONLY
         */
 
-        let node_offset = self.tree.wrapping_add_signed(self.find_offset(node) as isize);
+        let node_offset = self.tree.wrapping_add_signed(self.find_offset(node).into());
 
-        stream.seek(node_offset);
+        stream.seek(node_offset as usize);
         let name_offset = stream.read_i32::<true>()?;
         let flags = stream.read_u16::<true>()?;
         let is_directory = flags & 2 != 0;
@@ -178,7 +183,7 @@ impl QtResourceInfo {
             let locale = stream.read_u32::<true>()?;
             let data_offset = stream.read_i32::<true>()?;
 
-            QtNodeAux::Resource { locale, is_compressed, file_offset: self.data.wrapping_add_signed(data_offset as isize), data: self.read_data(buffer, data_offset)? }
+            QtNodeAux::Resource { locale, is_compressed, file_offset: self.data.wrapping_add_signed(data_offset.into()), data: self.read_data(buffer, data_offset)? }
         };
 
         let last_modified = if self.version >= 2 {

@@ -6,13 +6,14 @@
 pub mod binary_stream;
 pub mod extractor;
 pub mod aob;
+pub mod image;
 
-use goblin::pe::{PE, section_table::SectionTable};
 use std::{fs, env, io::Write, collections::HashSet};
 use std::path::PathBuf;
 use regex::{self, Regex};
 use extractor::QtResourceInfo;
 use binary_stream::BinaryReader;
+use image::*;
 
 const USAGE: &str = "usage: qtextract filename [options]
 options:
@@ -38,11 +39,15 @@ fn check_opt(flag: &str) -> bool {
     env::args().any(|s| s == flag)
 }
 
+// Q_CORE_EXPORT bool qRegisterResourceData(int version, const unsigned char *tree,
+//                                          const unsigned char *name, const unsigned char *data)
+
 struct SignatureDefinition {
-    id: i32,
+    tag: &'static str,
+    flags: usize,
     x64: bool,
     signature: &'static [(u8, bool)],
-    extractor: fn(offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResourceInfo>
+    extractor: fn(offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo>
 }
 
 impl SignatureDefinition {
@@ -78,56 +83,20 @@ impl SignatureDefinition {
     }
 }
 
-trait GoblinPEExtensions {
-    fn rva2fo(&self, rva: usize) -> Option<usize>;
-    fn fo2rva(&self, offset: usize) -> Option<usize>;
-    fn va2fo(&self, offset: usize) -> Option<usize>;
-}
-
-impl GoblinPEExtensions for PE<'_> {
-    fn rva2fo(&self, rva: usize) -> Option<usize> {
-        goblin::pe::utils::find_offset(rva,
-            &self.sections,
-            self.header.optional_header.unwrap().windows_fields.file_alignment,
-            &goblin::pe::options::ParseOptions::default()
-        )
-    }
-
-    fn fo2rva(&self, offset: usize) -> Option<usize> {
-        for section in &self.sections {
-            let prd = section.pointer_to_raw_data as usize;
-            let srd = section.size_of_raw_data as usize;
-            let va = section.virtual_address as usize;
-
-            if offset >= prd && offset < prd + srd {
-                return Some((offset - prd) + va)
-            }
-        }
-        None
-    }
-
-    fn va2fo(&self, va: usize) -> Option<usize> {
-        if va >= self.image_base {
-            return self.rva2fo(va - self.image_base)
-        }
-        None
-    }
-}
-
-fn x86_extract(offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResourceInfo> {
-    let mut offsets = [0usize; 3];
+fn x86_extract(offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let mut offsets = [0u64; 3];
 
     let mut stream = BinaryReader::new(bytes);
     for i in 0..3 {
         stream.skip(1); // skip 0x68 (push)
-        offsets[i] = pe.rva2fo(stream.read_u32::<false>()? as usize - pe.image_base)?;
+        offsets[i] = image.va2fo(stream.read_u32::<false>()?.into())?;
     }
     stream.skip(1); // skip 0x6A (push)
     let version = stream.read_byte()? as usize;
 
     Some(QtResourceInfo {
-        signature_id: -1,
-        registrar: offset,
+        signature_tag: None,
+        registrar: offset as u64,
         data: offsets[0],
         name: offsets[1],
         tree: offsets[2],
@@ -135,23 +104,23 @@ fn x86_extract(offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResourceInfo> {
     })
 }
 
-fn x64_extract1(bytes_offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResourceInfo> {
-    let mut result = [0usize; 3];
-    let bytes_rva = pe.fo2rva(bytes_offset)?;
+fn x64_extract_dntv(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let mut result = [0u64; 3];
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
     let mut stream = BinaryReader::new_at(bytes, 0);
 
     for i in 0..3 {
         stream.skip(3);
-        let v = stream.read_u32::<false>()? as usize;
-        result[i] = pe.rva2fo(bytes_rva + stream.position() + v)?;
+        let v = stream.read_i32::<false>()?;
+        result[i] = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
     }
 
     stream.skip(1);
     let version = stream.read_u32::<false>()? as usize;
 
     Some(QtResourceInfo {
-        signature_id: -1,
-        registrar: bytes_offset,
+        signature_tag: None,
+        registrar: bytes_offset as u64,
         data: result[0],
         name: result[1],
         tree: result[2],
@@ -159,22 +128,50 @@ fn x64_extract1(bytes_offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResource
     })
 }
 
-fn x64_extract2(bytes_offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResourceInfo> {
-    let bytes_rva = pe.fo2rva(bytes_offset)?;
+fn x64_extract_tndv(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let mut result = [0u64; 3];
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
     let mut stream = BinaryReader::new_at(bytes, 0);
 
+    for i in 0..3 {
+        stream.skip(3);
+        let v = stream.read_i32::<false>()?;
+        result[i] = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+    }
+
+    stream.skip(1);
+    let version = stream.read_u32::<false>()? as usize;
+
+    Some(QtResourceInfo {
+        signature_tag: None,
+        registrar: bytes_offset as u64,
+        data: result[2],
+        name: result[1],
+        tree: result[0],
+        version
+    })
+}
+
+fn x64_extract_dvnt(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
+    let mut stream = BinaryReader::new_at(bytes, 0);
+    let mut v: i32;
+
     stream.skip(3);
-    let data = pe.rva2fo(stream.read_u32::<false>()? as usize + bytes_rva + stream.position())?;
+    v = stream.read_i32::<false>()?;
+    let data = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
     stream.skip(1);
     let version = stream.read_u32::<false>()? as usize;
     stream.skip(3);
-    let name = pe.rva2fo(stream.read_u32::<false>()? as usize + bytes_rva + stream.position())?;
+    v = stream.read_i32::<false>()?;
+    let name = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
     stream.skip(3);
-    let tree = pe.rva2fo(stream.read_u32::<false>()? as usize + bytes_rva + stream.position())?;
+    v = stream.read_i32::<false>()?;
+    let tree = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
     
     Some(QtResourceInfo {
-        signature_id: -1,
-        registrar: bytes_offset,
+        signature_tag: None,
+        registrar: bytes_offset as u64,
         data,
         name,
         tree,
@@ -182,25 +179,85 @@ fn x64_extract2(bytes_offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResource
     })
 }
 
-fn x86_extract_mingw(bytes_offset: usize, bytes: &[u8], pe: &PE) -> Option<QtResourceInfo> {
-    let mut result = [0usize; 3];
+fn x86_extract_mingw(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let mut result = [0u64; 3];
     let mut stream = BinaryReader::new_at(bytes, 0);
 
     for i in 0..3 {
         stream.skip(4);
-        let v = stream.read_u32::<false>()? as usize;
-        result[i] = pe.va2fo(v)?;
+        let v = stream.read_u32::<false>()? as u64;
+        result[i] = image.va2fo(v)?;
     }
 
     stream.skip(3);
     let version = stream.read_u32::<false>()? as usize;
 
     Some(QtResourceInfo {
-        signature_id: -1,
-        registrar: bytes_offset,
+        signature_tag: None,
+        registrar: bytes_offset as u64,
         data: result[0],
         name: result[1],
         tree: result[2],
+        version
+    })
+}
+
+fn x64_extract_dnvt(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
+    let mut stream = BinaryReader::new_at(bytes, 0);
+    let mut v: i32;
+
+    stream.skip(3);
+    v = stream.read_i32::<false>()?;
+    let data = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+
+    stream.skip(3);
+    v = stream.read_i32::<false>()?;
+    let name = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+
+    stream.skip(1);
+    let version = stream.read_u32::<false>()? as usize;
+
+    stream.skip(3);
+    v = stream.read_i32::<false>()?;
+    let tree = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+    
+    Some(QtResourceInfo {
+        signature_tag: None,
+        registrar: bytes_offset as u64,
+        data,
+        name,
+        tree,
+        version
+    })
+}
+
+fn x64_extract_ntvd(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
+    let mut stream = BinaryReader::new_at(bytes, 0);
+    let mut v: i32;
+
+    stream.skip(3);
+    v = stream.read_i32::<false>()?;
+    let name = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+
+    stream.skip(3);
+    v = stream.read_i32::<false>()?;
+    let tree = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+    
+    stream.skip(1);
+    let version = stream.read_u32::<false>()? as usize;
+
+    stream.skip(3);
+    v = stream.read_i32::<false>()?;
+    let data = image.va2fo((bytes_va + stream.position() as u64).wrapping_add_signed(v.into()))?;
+    
+    Some(QtResourceInfo {
+        signature_tag: None,
+        registrar: bytes_offset as u64,
+        data,
+        name,
+        tree,
         version
     })
 }
@@ -209,6 +266,7 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
     SignatureDefinition {
         /*
         msvc, 32-bit, absolute offsets
+        sample: RPGMV, old RobloxStudioBeta
 
         68 00 00 00 00          push   0x0
         68 00 00 00 00          push   0x0
@@ -217,7 +275,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         e8 00 00 00 00          call   0x16
          */
 
-        id: 0,
+        tag: "msvc-x86_0",
+        flags: IMAGE_FLAGS_PE,
         x64: false,
         signature: define_signature!(b"68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 6A ?? E8 ?? ?? ?? ??"),
         extractor: x86_extract
@@ -225,6 +284,7 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
     SignatureDefinition {
         /*
         msvc, 32-bit, absolute offsets
+        sample: RPGMZ
 
         68 00 00 00 00          push   0x0
         68 00 00 00 00          push   0x0
@@ -232,7 +292,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         6a 00                   push   0x0
         ff 15 00 00 00 00       call   DWORD PTR ds:0x0
          */
-        id: 1,
+        tag: "msvc-x86_1",
+        flags: IMAGE_FLAGS_PE,
         x64: false,
         signature: define_signature!(b"68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 6A ?? FF 15"),
         extractor: x86_extract
@@ -240,6 +301,7 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
     SignatureDefinition {
         /*
         msvc, 64-bit, relative offsets
+        sample: RobloxStudioBeta
 
         4c 8d 0d 00 00 00 00    lea    r9,[rip+0x0]
         4c 8d 05 00 00 00 00    lea    r8,[rip+0x0]
@@ -247,14 +309,16 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         b9 00 00 00 00          mov    ecx,0x0
         e8 00 00 00 00          call   0x0
          */
-        id: 2,
+        tag: "msvc-x64_0",
+        flags: IMAGE_FLAGS_PE,
         x64: true,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? B9 ?? 00 00 00 E8"),
-        extractor: x64_extract1
+        extractor: x64_extract_dntv
     },
     SignatureDefinition {
         /*
         msvc, 64-bit, relative offsets
+        sample: Chatterino
 
         4c 8d 0d 00 00 00 00    lea    r9,[rip+0x0]
         4c 8d 05 00 00 00 00    lea    r8,[rip+0x0]
@@ -262,14 +326,16 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         b9 00 00 00 00          mov    ecx,0x0
         ff 15 ef d7 02 00       call   QWORD PTR [rip+0x0]
          */
-        id: 3,
+        tag: "msvc-x64_1",
+        flags: IMAGE_FLAGS_PE,
         x64: true,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? B9 ?? 00 00 00 FF 15"),
-        extractor: x64_extract1
+        extractor: x64_extract_dntv
     },
     SignatureDefinition {
         /*
         msvc, 64-bit, relative offsets
+        sample: Wireshark, RobloxStudioBeta
 
         4c 8d 0d 00 00 00 00    lea    r9,[rip+0x0]
         b9 00 00 00 00          mov    ecx,0x0
@@ -277,14 +343,16 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         48 8d 15 00 00 00 00    lea    rdx,[rip+0x0]
         e8 00 00 00 00          call   0x23
          */
-        id: 4,
+        tag: "msvc-x64_2",
+        flags: IMAGE_FLAGS_PE,
         x64: true,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? B9 ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? E8"),
-        extractor: x64_extract2
+        extractor: x64_extract_dvnt
     },
     SignatureDefinition {
         /*
         msvc, 64-bit, relative offsets
+        sample: Chatterino
 
         4c 8d 0d 00 00 00 00    lea    r9,[rip+0x0]
         b9 00 00 00 00          mov    ecx,0x0
@@ -292,14 +360,16 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         48 8d 15 00 00 00 00    lea    rdx,[rip+0x0]
         ff 15 00 00 00 00       call   QWORD PTR [rip+0x0]
          */
-        id: 5,
+        tag: "msvc-x64_3",
+        flags: IMAGE_FLAGS_PE,
         x64: true,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? B9 ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? FF 15"),
-        extractor: x64_extract2
+        extractor: x64_extract_dvnt
     },
     SignatureDefinition {
         /*
         mingw, 32-bit, absolute offsets (see issue #8)
+        sample: Radar-PCManager (see issue #8)
 
         c7 44 24 0c 00 00 00 00 mov    DWORD PTR [esp+0xc],0x0
         c7 44 24 08 00 00 00 00 mov    DWORD PTR [esp+0x8],0x0
@@ -307,7 +377,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         c7 04 24 00 00 00 00    mov    DWORD PTR [esp],0x0
         ff 15 00 00 00 00       call   DWORD PTR ds:0x0
          */
-        id: 6,
+        tag: "mingw-x86_0",
+        flags: IMAGE_FLAGS_PE,
         x64: false,
         signature: define_signature!(b"C7 44 24 0C ?? ?? ?? ?? C7 44 24 08 ?? ?? ?? ?? C7 44 24 04 ?? ?? ?? ?? C7 04 24 ?? 00 00 00 FF 15"),
         extractor: x86_extract_mingw
@@ -322,59 +393,114 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         c7 04 24 00 00 00 00    mov    DWORD PTR [esp],0x0
         e8 00 00 00 00          call   0x0
          */
-        id: 7,
+        tag: "mingw-x86_1",
+        flags: IMAGE_FLAGS_PE,
         x64: false,
         signature: define_signature!(b"C7 44 24 0C ?? ?? ?? ?? C7 44 24 08 ?? ?? ?? ?? C7 44 24 04 ?? ?? ?? ?? C7 04 24 ?? 00 00 00 E8"),
         extractor: x86_extract_mingw
+    },
+    SignatureDefinition {
+        /*
+        gcc/clang, 64-bit, relative offsets
+        sample: Chatterino (Linux)
+
+        48 8d 0d 00 00 00 00    lea    rcx,[rip+0x0] # data
+        48 8d 15 00 00 00 00    lea    rdx,[rip+0x0] # name
+        bf 03 00 00 00          mov    edi,0x3 # version
+        48 8d 35 00 00 00 00    lea    rsi,[rip+0x0] # tree
+        e8 00 00 00 00          call   0x0
+         */
+
+        tag: "gnu-x64-dnvt",
+        flags: IMAGE_FLAGS_ELF | IMAGE_FLAGS_MACHO,
+        x64: true,
+        signature: define_signature!(b"48 8D 0D ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? BF ?? 00 00 00 48 8D 35 ?? ?? ?? ?? E8"),
+        extractor: x64_extract_dnvt
+    },
+    SignatureDefinition {
+        /*
+        gcc/clang, 64-bit, relative offsets
+        sample: Chatterino (Linux)
+
+        48 8d 15 00 00 00 00    lea    rdx,[rip+0x0] # name
+        48 8d 35 00 00 00 00    lea    rsi,[rip+0x0] # tree
+        bf 03 00 00 00          mov    edi,0x3 # version
+        48 8d 0d 00 00 00 00    lea    rcx,[rip+0x0] # data
+        e8 00 00 00 00          call   0x0
+         */
+
+        tag: "gnu-x64-ntvd",
+        flags: IMAGE_FLAGS_ELF | IMAGE_FLAGS_MACHO,
+        x64: true,
+        signature: define_signature!(b"48 8D 15 ?? ?? ?? ?? 48 8D 35 ?? ?? ?? ?? BF ?? 00 00 00 48 8D 0D ?? ?? ?? ?? E8"),
+        extractor: x64_extract_ntvd
+    },
+    SignatureDefinition {
+        /*
+        gcc/clang, 64-bit, relative offsets
+        sample: Chatterino (Mac)
+
+        48 8d 35 00 00 00 00    lea    rsi,[rip+0x0] # tree
+        48 8d 15 00 00 00 00    lea    rdx,[rip+0x0] # name
+        48 8d 0d 00 00 00 00    lea    rcx,[rip+0x0] # data
+        bf 03 00 00 00          mov    edi,0x3 # version
+        e8 00 00 00 00          call   0x0
+         */
+
+        tag: "gnu-x64-tndv",
+        flags: IMAGE_FLAGS_ELF | IMAGE_FLAGS_MACHO,
+        x64: true,
+        signature: define_signature!(b"48 8D 35 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? BF ?? 00 00 00 E8"),
+        extractor: x64_extract_tndv
     }
 ];
 
-fn get_target_section<'a>(pe: &'a PE) -> Option<&'a SectionTable> {
+fn get_target_section<'a>(image: &'a Image) -> Option<&'a ImageSection> {
     if !check_opt("--scanall") {
         if let Some(target) = check_opt_arg("--section") {
-            for v in &pe.sections {
-                if let Ok(name) = v.name() {
-                    if name == target {
+            for v in &image.sections {
+                if let Some(name) = &v.name {
+                    if *name == target {
                         return Some(v);
                     }
                 }
             }
         } else {
-            // IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE
-            return pe.sections.iter().find(|x| x.characteristics & (0x00000020 | 0x20000000) != 0);
+            return image.sections.iter().find(|x| x.is_code);
         }
     }
     None
 }
 
-fn do_scan(buffer: &[u8], start: usize, end: usize, pe: &PE) -> Vec<QtResourceInfo> {
-    let mut seen = HashSet::<usize>::new();
+fn do_scan(buffer: &[u8], start: usize, end: usize, image: &Image) -> Vec<QtResourceInfo> {
+    let mut seen = HashSet::<u64>::new();
     let mut results = Vec::<QtResourceInfo>::new();
 
-    for def in TEXT_SIGNATURES {
-        if def.x64 == pe.is_64 {
-            for fo in def.scan_all(buffer, start, end) {
-                if let Some(mut info) = (def.extractor)(fo, &buffer[fo..fo+def.signature.len()], pe) {
-                    if info.version < 10 { // simple sanity check
-                        if !seen.contains(&info.data) {
-                            seen.insert(info.data);
-                            info.signature_id = def.id;
-                            results.push(info);
-                        }
-                        continue;
-                    }
-                }
+    let signatures: Vec<&SignatureDefinition> = TEXT_SIGNATURES.iter().filter(|x| x.x64 == image.is_x64() && image.flags & x.flags != 0).collect();
 
-                #[cfg(debug_assertions)]
-                println!("DEBUG: Failed to extract parameters from signature at {:#08X}. Likely false positive", fo);
+    println!("Applicable signatures: {}", signatures.len());
+
+    for def in signatures {
+        for fo in def.scan_all(buffer, start, end) {
+            if let Some(mut info) = (def.extractor)(fo, &buffer[fo..fo+def.signature.len()], image) {
+                if info.version < 10 { // simple sanity check
+                    if seen.insert(info.data) {
+                        info.signature_tag = Some(def.tag);
+                        results.push(info);
+                    }
+                    continue;
+                }
             }
+
+            #[cfg(debug_assertions)]
+            println!("DEBUG: Failed to extract parameters from signature at {:#08X}. Likely false positive", fo);
         }
     }
 
     results
 }
 
-fn check_data_opt(pe: &PE) -> Option<Vec<QtResourceInfo>> {
+fn check_data_opt(image: &Image) -> Option<Vec<QtResourceInfo>> {
     // For providing resource chunk information that couldn't be found automatically
 	// If using IDA: The offsets can be found by setting the image base in IDA to 0 ( Edit->Segments->Rebase program... https://i.imgur.com/XWIzhEf.png ) 
 	// and then looking at calls to qRegisterResourceData ( https://i.imgur.com/D0gjkbH.png ) to extract the offsets.
@@ -391,21 +517,21 @@ fn check_data_opt(pe: &PE) -> Option<Vec<QtResourceInfo>> {
     if let Some(data_arg) = data_arg_opt {
         let regex = Regex::new(r"([a-fA-F0-9]+),([a-fA-F0-9]+),([a-fA-F0-9]+),([0-9]+)").unwrap();
         if let Some(captures) = regex.captures(data_arg.as_str()) {
-            let mut offsets = [0usize; 3];
+            let mut offsets = [0u64; 3];
 
             if is_rva {
                 for i in 1..=3 {
-                    offsets[i - 1] = pe.rva2fo(usize::from_str_radix(&captures[i], 16).unwrap()).expect("invalid rva passed to `datarva`");
+                    offsets[i - 1] = image.rva2fo(u64::from_str_radix(&captures[i], 16).unwrap()).expect("invalid rva passed to `datarva`");
                 }
             } else {
                 for i in 1..=3 {
-                    offsets[i - 1] = usize::from_str_radix(&captures[i], 16).unwrap();
+                    offsets[i - 1] = u64::from_str_radix(&captures[i], 16).unwrap();
                 }
             }
 
             let version = captures[4].parse().unwrap();
 
-            return Some(vec![ QtResourceInfo { signature_id: -1, registrar: 0, data: offsets[0], name: offsets[1], tree: offsets[2], version } ]);
+            return Some(vec![ QtResourceInfo { signature_tag: None, registrar: 0, data: offsets[0], name: offsets[1], tree: offsets[2], version } ]);
         }
     }
 
@@ -413,14 +539,14 @@ fn check_data_opt(pe: &PE) -> Option<Vec<QtResourceInfo>> {
 }
 
 // returns a pointer to a function like this: https://i.imgur.com/ilfgGPG.png
-fn ask_resource_data(buffer: &[u8], pe: &PE) -> Option<Vec<QtResourceInfo>> {
-    let start : usize;
-    let end : usize;
+fn ask_resource_data(buffer: &[u8], image: &Image) -> Option<Vec<QtResourceInfo>> {
+    let start: usize;
+    let end: usize;
 
-    if let Some(section) = get_target_section(pe) {
-        start = section.pointer_to_raw_data as usize;
-        end = start + section.size_of_raw_data as usize;
-        println!("Scanning section {} ({:#08x}-{:#08x})...", section.name().unwrap_or("N/A"), start, end);
+    if let Some(section) = get_target_section(image) {
+        start = section.file_offset as usize;
+        end = start + section.size as usize;
+        println!("Scanning section {} ({:#08x}-{:#08x})...", section.name.as_deref().unwrap_or("N/A"), start, end);
     } else {
         start = 0;
         end = buffer.len();
@@ -428,7 +554,7 @@ fn ask_resource_data(buffer: &[u8], pe: &PE) -> Option<Vec<QtResourceInfo>> {
     }
 
     let start_time = std::time::Instant::now();
-    let results = do_scan(buffer, start, end, pe);
+    let results = do_scan(buffer, start, end, image);
     println!("Done in {:.2?}", start_time.elapsed());
 
     if !results.is_empty() {
@@ -441,7 +567,7 @@ fn ask_resource_data(buffer: &[u8], pe: &PE) -> Option<Vec<QtResourceInfo>> {
             println!("0 - Dump all");
             
             for (i, result) in results.iter().enumerate() {
-                println!("{} - {:#08X} (via signature {}: version={}, data={:#08X}, name={:#08X}, tree={:#08X})", i + 1, result.registrar, result.signature_id, result.version, result.data, result.name, result.tree);
+                println!("{} - {:#08X} (via signature {}: version={}, data={:#08X}, name={:#08X}, tree={:#08X})", i + 1, result.registrar, result.signature_tag.unwrap_or("n/a"), result.version, result.data, result.name, result.tree);
             }
 
             println!();
@@ -483,11 +609,11 @@ fn main() {
         return
     }
 
-    let buffer = fs::read(path).expect("failed to read input file");
-    let pe = PE::parse(&buffer).expect("invalid pe file");
+    let buffer = fs::read(&path).expect("failed to read input file");
+    let image = Image::from(&buffer).expect("invalid executable file");    
     let output_directory = PathBuf::from(check_opt_arg("--output").unwrap_or("qtextract-output".to_string()));
 
-    if let Some(to_dump) = check_data_opt(&pe).or_else(|| ask_resource_data(&buffer, &pe)) {
+    if let Some(to_dump) = check_data_opt(&image).or_else(|| ask_resource_data(&buffer, &image)) {
         for (i, result) in to_dump.iter().enumerate() {
             print!("Extracting chunk #{} ({:#08X})... ", i + 1, result.registrar);
 

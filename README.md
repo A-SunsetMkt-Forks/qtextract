@@ -1,5 +1,5 @@
 ## About
-QtExtract is a tool for extracting Qt resources from x86/x64 Windows binaries (.exe/.dll)
+QtExtract is a tool for extracting Qt resources from x86 PE/ELF/MachO binaries
 
 It works by scanning for compiler generated calls to [qRegisterResourceData](https://wiki.qt.io/QtResources#How_it_works). The signatures used by QtExtract are not all-encompassing, and may result in false positives or false negatives. If you find a Qt application that doesn't work with QtExtract, feel free to open an issue. 
 
