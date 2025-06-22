@@ -14,6 +14,7 @@ use regex::{self, Regex};
 use extractor::QtResourceInfo;
 use binary_stream::BinaryReader;
 use image::*;
+use goblin::mach;
 
 const USAGE: &str = "usage: qtextract filename [options]
 options:
@@ -22,6 +23,7 @@ options:
   --output directory       For specifying an output directory
   --scanall                Scan the entire file (instead of the first executable section)
   --section section        For scanning a specific section
+  --macharch arch          For fat Mach binaries, specifies the architecture (arm64, x86_64, etc.)
   --data, --datarva info   [Advanced] Use these options to manually provide offsets to a qt resource in the binary
                            (e.g. if no chunks were found automatically by qtextract).
                            'info' should use the following format: %x,%x,%x,%d
@@ -44,8 +46,8 @@ fn check_opt(flag: &str) -> bool {
 
 struct SignatureDefinition {
     tag: &'static str,
-    flags: usize,
-    x64: bool,
+    match_flags: u32, // image flags must contain at least one of these, unless 0
+    require_flags: u32, // image flags must contain all of these
     signature: &'static [(u8, bool)],
     extractor: fn(offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo>
 }
@@ -262,6 +264,91 @@ fn x64_extract_ntvd(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<
     })
 }
 
+// don't ask why i'm not using a disassembler
+const fn arm64_decode_adrl(adrp: u32, add: u32, pc: u64) -> u64 {   
+    let page = pc & !0xFFF;
+    
+    let adrp_offset = {
+        // https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/ADRP--Form-PC-relative-address-to-4KB-page-?lang=en
+        let hi = (adrp >> 5) & 0x7FFFF;
+        let lo = (adrp >> 29) & 3;
+        let imm = ((hi << 2) | lo) as u64;
+        let sximm = if imm & 0x100000 != 0 { imm | !0x1FFFFF } else { imm };
+        sximm as i64 * 4096
+    };
+    
+    let add_offset = {
+        // https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/ADD--immediate---Add-immediate-value-?lang=en
+        let value = (add >> 10) & 0xFFF;
+        let shift = (add >> 22) & 1;
+        let imm = value << (shift * 12);
+        imm as u64
+    };
+
+    page.wrapping_add_signed(adrp_offset).wrapping_add(add_offset)
+}
+
+const fn arm64_decode_movz(movz: u32) -> u32 {
+    // https://developer.arm.com/documentation/ddi0602/2025-03/Base-Instructions/MOVZ--Move-wide-with-zero-?lang=en
+    let value = (movz >> 5) & 0xFFFF;
+    let shift = (movz >> 21) & 3;
+    value << (shift * 16)
+}
+
+fn arm64_extract(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
+    if bytes_va & 3 != 0 {
+        return None;
+    }
+
+    let mut stream = BinaryReader::new_at(bytes, 0);
+    let mut insns = [0u32; 8];
+    for i in 0..insns.len() {
+        insns[i] = stream.read_u32::<false>()?;
+    }
+
+    let tree = image.va2fo(arm64_decode_adrl(insns[0], insns[1], bytes_va))?;
+    let name = image.va2fo(arm64_decode_adrl(insns[2], insns[3], bytes_va + 8))?;
+    let data = image.va2fo(arm64_decode_adrl(insns[4], insns[5], bytes_va + 16))?;
+    let version = arm64_decode_movz(insns[6]) as usize;
+    
+    Some(QtResourceInfo {
+        signature_tag: None,
+        registrar: bytes_offset as u64,
+        data,
+        name,
+        tree,
+        version
+    })
+}
+
+fn arm64_extract_unique(bytes_offset: usize, bytes: &[u8], image: &Image) -> Option<QtResourceInfo> {
+    let bytes_va = image.fo2va(bytes_offset as u64)?;
+    if bytes_va & 3 != 0 {
+        return None;
+    }
+
+    let mut stream = BinaryReader::new_at(bytes, 0);
+    let mut insns = [0u32; 8];
+    for i in 0..insns.len() {
+        insns[i] = stream.read_u32::<false>()?;
+    }
+
+    let data = image.va2fo(arm64_decode_adrl(insns[0], insns[1], bytes_va))?;
+    let name = image.va2fo(arm64_decode_adrl(insns[2], insns[4], bytes_va + 8))?;
+    let tree = image.va2fo(arm64_decode_adrl(insns[5], insns[7], bytes_va + 20))?;
+    let version = arm64_decode_movz(insns[6]) as usize;
+    
+    Some(QtResourceInfo {
+        signature_tag: None,
+        registrar: bytes_offset as u64,
+        data,
+        name,
+        tree,
+        version
+    })
+}
+
 static TEXT_SIGNATURES: &[SignatureDefinition] = &[
     SignatureDefinition {
         /*
@@ -276,8 +363,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
          */
 
         tag: "msvc-x86_0",
-        flags: IMAGE_FLAGS_PE,
-        x64: false,
+        match_flags: 0,
+        require_flags: IM_TYPE_PE | IM_ARCH_X86,
         signature: define_signature!(b"68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 6A ?? E8 ?? ?? ?? ??"),
         extractor: x86_extract
     },
@@ -293,8 +380,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         ff 15 00 00 00 00       call   DWORD PTR ds:0x0
          */
         tag: "msvc-x86_1",
-        flags: IMAGE_FLAGS_PE,
-        x64: false,
+        match_flags: 0,
+        require_flags: IM_TYPE_PE | IM_ARCH_X86,
         signature: define_signature!(b"68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 68 ?? ?? ?? ?? 6A ?? FF 15"),
         extractor: x86_extract
     },
@@ -310,8 +397,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         e8 00 00 00 00          call   0x0
          */
         tag: "msvc-x64_0",
-        flags: IMAGE_FLAGS_PE,
-        x64: true,
+        match_flags: 0,
+        require_flags: IM_TYPE_PE | IM_ARCH_X86_64,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? B9 ?? 00 00 00 E8"),
         extractor: x64_extract_dntv
     },
@@ -327,8 +414,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         ff 15 ef d7 02 00       call   QWORD PTR [rip+0x0]
          */
         tag: "msvc-x64_1",
-        flags: IMAGE_FLAGS_PE,
-        x64: true,
+        match_flags: 0,
+        require_flags: IM_TYPE_PE | IM_ARCH_X86_64,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? B9 ?? 00 00 00 FF 15"),
         extractor: x64_extract_dntv
     },
@@ -344,8 +431,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         e8 00 00 00 00          call   0x23
          */
         tag: "msvc-x64_2",
-        flags: IMAGE_FLAGS_PE,
-        x64: true,
+        match_flags: 0,
+        require_flags: IM_TYPE_PE | IM_ARCH_X86_64,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? B9 ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? E8"),
         extractor: x64_extract_dvnt
     },
@@ -361,8 +448,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         ff 15 00 00 00 00       call   QWORD PTR [rip+0x0]
          */
         tag: "msvc-x64_3",
-        flags: IMAGE_FLAGS_PE,
-        x64: true,
+        match_flags: 0,
+        require_flags: IM_TYPE_PE | IM_ARCH_X86_64,
         signature: define_signature!(b"4C 8D 0D ?? ?? ?? ?? B9 ?? ?? ?? ?? 4C 8D 05 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? FF 15"),
         extractor: x64_extract_dvnt
     },
@@ -378,8 +465,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         ff 15 00 00 00 00       call   DWORD PTR ds:0x0
          */
         tag: "mingw-x86_0",
-        flags: IMAGE_FLAGS_PE,
-        x64: false,
+        match_flags: 0,
+        require_flags: IM_ARCH_X86,
         signature: define_signature!(b"C7 44 24 0C ?? ?? ?? ?? C7 44 24 08 ?? ?? ?? ?? C7 44 24 04 ?? ?? ?? ?? C7 04 24 ?? 00 00 00 FF 15"),
         extractor: x86_extract_mingw
     },
@@ -394,8 +481,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
         e8 00 00 00 00          call   0x0
          */
         tag: "mingw-x86_1",
-        flags: IMAGE_FLAGS_PE,
-        x64: false,
+        match_flags: 0,
+        require_flags: IM_ARCH_X86,
         signature: define_signature!(b"C7 44 24 0C ?? ?? ?? ?? C7 44 24 08 ?? ?? ?? ?? C7 44 24 04 ?? ?? ?? ?? C7 04 24 ?? 00 00 00 E8"),
         extractor: x86_extract_mingw
     },
@@ -412,8 +499,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
          */
 
         tag: "gnu-x64-dnvt",
-        flags: IMAGE_FLAGS_ELF | IMAGE_FLAGS_MACHO,
-        x64: true,
+        match_flags: IM_TYPE_ELF | IM_TYPE_MACHO,
+        require_flags: IM_ARCH_X86_64,
         signature: define_signature!(b"48 8D 0D ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? BF ?? 00 00 00 48 8D 35 ?? ?? ?? ?? E8"),
         extractor: x64_extract_dnvt
     },
@@ -430,8 +517,8 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
          */
 
         tag: "gnu-x64-ntvd",
-        flags: IMAGE_FLAGS_ELF | IMAGE_FLAGS_MACHO,
-        x64: true,
+        match_flags: IM_TYPE_ELF | IM_TYPE_MACHO,
+        require_flags: IM_ARCH_X86_64,
         signature: define_signature!(b"48 8D 15 ?? ?? ?? ?? 48 8D 35 ?? ?? ?? ?? BF ?? 00 00 00 48 8D 0D ?? ?? ?? ?? E8"),
         extractor: x64_extract_ntvd
     },
@@ -448,10 +535,59 @@ static TEXT_SIGNATURES: &[SignatureDefinition] = &[
          */
 
         tag: "gnu-x64-tndv",
-        flags: IMAGE_FLAGS_ELF | IMAGE_FLAGS_MACHO,
-        x64: true,
+        match_flags: IM_TYPE_ELF | IM_TYPE_MACHO,
+        require_flags: IM_ARCH_X86_64,
         signature: define_signature!(b"48 8D 35 ?? ?? ?? ?? 48 8D 15 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? BF ?? 00 00 00 E8"),
         extractor: x64_extract_tndv
+    },
+
+    // ARM signatures
+    // byte masks suck for sigging ARM code, but these work for now
+    // TODO: bit-level masks or pattern matching disassembly
+
+    SignatureDefinition {
+        /*
+        aarch64
+        sample: Chatterino (Mac)
+
+        81 26 00 B0    adrp x1, #0x4d1000 # tree hi
+        21 AC 08 91    add  x1, x1, #0x22b # tree lo
+        82 26 00 B0    adrp x2, #0x4d1000 # name hi
+        42 34 3B 91    add  x2, x2, #0xecd # name lo
+        83 26 00 F0    adrp x3, #0x4d3000 # data hi
+        63 6C 02 91    add  x3, x3, #0x9b # data lo
+        60 00 80 52    movz w0, #0x3 # version
+        49 80 09 94    bl   #0x260140 
+         */
+
+        tag: "arm64_0",
+        match_flags: IM_TYPE_ELF | IM_TYPE_MACHO,
+        require_flags: IM_ARCH_ARM64,
+        signature: define_signature!(b"?? ?? ?? ?? 21 ?? ?? 91 ?? ?? ?? ?? 42 ?? ?? 91 ?? ?? ?? ?? 63 ?? ?? 91 ?? ?? ?? 52 ?? ?? ?? ??"),
+        extractor: arm64_extract
+    },
+
+    SignatureDefinition {
+        /*
+        aarch64
+        sample: transmission-qt (see issue #10)
+
+        E3 0C 00 F0    adrp x3, #0x19f000 # data hi
+        63 40 27 91    add  x3, x3, #0x9d0 # data lo
+        E2 0C 00 F0    adrp x2, #0x19f000 # name hi
+        20 68 07 F9    str  x0, [x1, #0xed0]
+        42 80 17 91    add  x2, x2, #0x5e0 # name lo
+        E1 0C 00 F0    adrp x1, #0x19f000 # tree hi
+        60 00 80 52    movz w0, #0x3 # version
+        21 40 1B 91    add  x1, x1, #0x6d0 # tree lo
+        8A DE FF 97    bl   #0xffffffffffff7a48    
+         */
+
+        tag: "arm64_1",
+        match_flags: IM_TYPE_ELF | IM_TYPE_MACHO,
+        require_flags: IM_ARCH_ARM64,
+        signature: define_signature!(b"?? ?? ?? ?? 63 ?? ?? 91 ?? ?? ?? ?? ?? ?? ?? F9 42 ?? ?? 91 ?? ?? ?? ?? ?? ?? ?? 52 21 ?? ?? 91 ?? ?? ?? ??"),
+        extractor: arm64_extract_unique
     }
 ];
 
@@ -475,26 +611,30 @@ fn get_target_section<'a>(image: &'a Image) -> Option<&'a ImageSection> {
 fn do_scan(buffer: &[u8], start: usize, end: usize, image: &Image) -> Vec<QtResourceInfo> {
     let mut seen = HashSet::<u64>::new();
     let mut results = Vec::<QtResourceInfo>::new();
+    
+    let signatures: Vec<&SignatureDefinition> = TEXT_SIGNATURES.iter().filter(|x| (x.match_flags == 0 || image.flags & x.match_flags != 0) && image.flags & x.require_flags == x.require_flags).collect();
+    
+    if !signatures.is_empty() {
+        println!("Applicable signatures ({}): {}", signatures.len(), signatures.iter().map(|def| def.tag).collect::<Vec<&'static str>>().join(", "));
 
-    let signatures: Vec<&SignatureDefinition> = TEXT_SIGNATURES.iter().filter(|x| x.x64 == image.is_x64() && image.flags & x.flags != 0).collect();
-
-    println!("Applicable signatures: {}", signatures.len());
-
-    for def in signatures {
-        for fo in def.scan_all(buffer, start, end) {
-            if let Some(mut info) = (def.extractor)(fo, &buffer[fo..fo+def.signature.len()], image) {
-                if info.version < 10 { // simple sanity check
-                    if seen.insert(info.data) {
-                        info.signature_tag = Some(def.tag);
-                        results.push(info);
+        for def in signatures {
+            for fo in def.scan_all(buffer, start, end) {
+                if let Some(mut info) = (def.extractor)(fo, &buffer[fo..fo+def.signature.len()], image) {
+                    if info.version < 10 { // simple sanity check
+                        if seen.insert(info.data) {
+                            info.signature_tag = Some(def.tag);
+                            results.push(info);
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            }
 
-            #[cfg(debug_assertions)]
-            println!("DEBUG: Failed to extract parameters from signature at {:#08X}. Likely false positive", fo);
+                #[cfg(debug_assertions)]
+                println!("DEBUG: Failed to extract parameters from signature at {:#08X}. Likely false positive", fo);
+            }
         }
+    } else {
+        println!("WARNING: No applicable signatures exist for this binary");
     }
 
     results
@@ -558,6 +698,7 @@ fn ask_resource_data(buffer: &[u8], image: &Image) -> Option<Vec<QtResourceInfo>
     println!("Done in {:.2?}", start_time.elapsed());
 
     if !results.is_empty() {
+        #[allow(clippy::option_if_let_else)]
         let chunk_id = if let Some(arg) = check_opt_arg("--chunk") {
             let id: usize = arg.trim().parse().expect("integer value expected for `chunk` parameter");
             assert!(id <= results.len(), "value provided by `chunk` parameter is out of range");
@@ -609,8 +750,17 @@ fn main() {
         return
     }
 
+    let mut mach_hint: Option<mach::cputype::CpuType> = None;
+    if let Some(hint) = check_opt_arg("--macharch") {
+        if let Some((cpu_type, _)) = mach::cputype::get_arch_from_flag(hint.as_str()) {
+            mach_hint = Some(cpu_type)
+        } else {
+            println!("WARNING: Invalid architecture hint '{}'", hint);
+        }
+    }
+
     let buffer = fs::read(&path).expect("failed to read input file");
-    let image = Image::from(&buffer).expect("invalid executable file");    
+    let image = Image::from(&buffer, mach_hint).expect("invalid executable file");    
     let output_directory = PathBuf::from(check_opt_arg("--output").unwrap_or("qtextract-output".to_string()));
 
     if let Some(to_dump) = check_data_opt(&image).or_else(|| ask_resource_data(&buffer, &image)) {

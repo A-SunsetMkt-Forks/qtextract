@@ -1,4 +1,4 @@
-use goblin::{elf::program_header::PT_LOAD, mach::{constants::{VM_PROT_EXECUTE, VM_PROT_WRITE}, cputype::CPU_TYPE_X86}, pe::section_table::{IMAGE_SCN_CNT_CODE, IMAGE_SCN_MEM_EXECUTE, IMAGE_SCN_MEM_WRITE}};
+use goblin::{self, pe, elf, mach};
 use std::fmt;
 
 // goblin::Object without fat mach
@@ -9,11 +9,17 @@ pub enum ImageBinary<'a> {
     Unknown()
 }
 
-pub const IMAGE_FLAGS_PE: usize = 1 << 0;
-pub const IMAGE_FLAGS_ELF: usize = 1 << 1;
-pub const IMAGE_FLAGS_MACHO: usize = 1 << 2;
+pub const IM_TYPE_PE: u32 = 1 << 0;
+pub const IM_TYPE_ELF: u32 = 1 << 1;
+pub const IM_TYPE_MACHO: u32 = 1 << 2;
 
-pub const IMAGE_FLAGS_64BIT: usize = 1 << 8;
+pub const IM_FLAGS_32BIT: u32 = 1 << 8;
+pub const IM_FLAGS_64BIT: u32 = 1 << 9;
+
+pub const IM_ARCH_X86: u32 = 1 << 16;
+pub const IM_ARCH_X86_64: u32 = 1 << 17;
+pub const IM_ARCH_ARM: u32 = 1 << 18;
+pub const IM_ARCH_ARM64: u32 = 1 << 19;
 
 impl ImageBinary<'_> {
     #[must_use]
@@ -39,7 +45,7 @@ pub struct ImageSection {
 
 pub struct Image<'a> {
     pub binary: ImageBinary<'a>,
-    pub flags: usize,
+    pub flags: u32,
     pub base: u64,
     pub sections: Vec<ImageSection>
 }
@@ -57,18 +63,23 @@ impl fmt::Debug for Image<'_> {
 
 impl Image<'_> {
     #[must_use]
-    pub fn from(buffer: &[u8]) -> Option<Image> {
+    pub fn from(buffer: &[u8], mach_hint: Option<mach::cputype::CpuType>) -> Option<Image> {
+        let mut macho_base: u32 = 0;
+
         let binary = match goblin::Object::parse(buffer).ok()? {
             goblin::Object::PE(pe) => ImageBinary::PE(pe),
             goblin::Object::Elf(elf) => ImageBinary::ELF(elf),
             goblin::Object::Mach(mach) => {
                 ImageBinary::MachO(match mach {
-                    // TODO: user option to specify arch, if necessary
-                    goblin::mach::Mach::Fat(fat) => {
-                        let index = fat.iter_arches().position(|a| a.is_ok_and(|x| x.cputype & CPU_TYPE_X86 != 0));
-                        fat.get(index?).ok()?
+                    mach::Mach::Fat(fat) => {
+                        let arches = fat.iter_arches().filter_map(|a| a.ok()).collect::<Vec<mach::fat::FatArch>>();
+                        let index = arches.iter().position(|x| mach_hint.map_or(x.cputype & !mach::cputype::CPU_ARCH_MASK == mach::cputype::CPU_TYPE_X86, |hint| x.cputype == hint)).unwrap_or(0);
+                        macho_base = arches[index].offset;
+                        let macho = fat.get(index).ok()?;
+                        println!("NOTICE: Using binary #{}/{} (arch: {}, offset: {}) in fat Mach binary", index + 1, fat.narches, mach::cputype::get_arch_name_from_types(macho.header.cputype, macho.header.cpusubtype).unwrap_or("unknown"), macho_base);
+                        macho
                     },
-                    goblin::mach::Mach::Binary(bin) => bin
+                    mach::Mach::Binary(bin) => bin
                 })
             },
             _ => {
@@ -77,14 +88,20 @@ impl Image<'_> {
         };
 
         let mut sections: Vec<ImageSection> = Vec::new();
-        let mut flags: usize = 0;
+        let mut flags: u32 = 0;
 
         match &binary {
             ImageBinary::PE(pe) => {
-                flags |= IMAGE_FLAGS_PE;
-                if pe.is_64 {
-                    flags |= IMAGE_FLAGS_64BIT;
-                }
+                flags |= IM_TYPE_PE;
+                flags |= if pe.is_64 { IM_FLAGS_64BIT } else { IM_FLAGS_32BIT };
+
+                flags |= match pe.header.coff_header.machine {
+                    0x14c => IM_ARCH_X86,
+                    0x8664 => IM_ARCH_X86_64,
+                    0x1c0 => IM_ARCH_ARM,
+                    0xaa64 => IM_ARCH_ARM64,
+                    _ => { return None; }
+                };
 
                 for section in &pe.sections {
                     sections.push(ImageSection {
@@ -92,24 +109,30 @@ impl Image<'_> {
                         file_offset: u64::from(section.pointer_to_raw_data),
                         size: u64::from(section.size_of_raw_data),
                         virtual_address: u64::from(section.virtual_address) + pe.image_base as u64,
-                        is_writable: (section.characteristics & IMAGE_SCN_MEM_WRITE) != 0,
-                        is_code: (section.characteristics & (IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE)) != 0
+                        is_writable: (section.characteristics & pe::section_table::IMAGE_SCN_MEM_WRITE) != 0,
+                        is_code: (section.characteristics & (pe::section_table::IMAGE_SCN_CNT_CODE | pe::section_table::IMAGE_SCN_MEM_EXECUTE)) != 0
                     });
                 }
             },
             ImageBinary::ELF(elf) => {
-                flags |= IMAGE_FLAGS_ELF;
-                if elf.is_64 {
-                    flags |= IMAGE_FLAGS_64BIT;
-                }
-
                 // for now
                 if !elf.little_endian {
                     return None;
                 }
 
+                flags |= IM_TYPE_ELF;
+                flags |= if elf.is_64 { IM_FLAGS_64BIT } else { IM_FLAGS_32BIT };
+
+                flags |= match elf.header.e_machine {
+                    3 => IM_ARCH_X86,
+                    62 => IM_ARCH_X86_64,
+                    40 => IM_ARCH_ARM,
+                    183 => IM_ARCH_ARM64,
+                    _ => { return None; }
+                };                
+
                 for segment in &elf.program_headers {
-                    if segment.p_type == PT_LOAD {
+                    if segment.p_type == elf::program_header::PT_LOAD {
                         sections.push(ImageSection {
                             name: Some(format!("PHDR_{:08X}", segment.p_offset)),
                             file_offset: segment.p_offset,
@@ -122,24 +145,30 @@ impl Image<'_> {
                 }
             },
             ImageBinary::MachO(macho) => {
-                flags |= IMAGE_FLAGS_MACHO;
-                if macho.is_64 {
-                    flags |= IMAGE_FLAGS_64BIT;
-                }
-
                 // for now
                 if !macho.little_endian {
                     return None;
                 }
 
+                flags |= IM_TYPE_MACHO;
+                flags |= if macho.is_64 { IM_FLAGS_64BIT } else { IM_FLAGS_32BIT };
+
+                flags |= match macho.header.cputype {
+                    mach::cputype::CPU_TYPE_X86 => IM_ARCH_X86,
+                    mach::cputype::CPU_TYPE_X86_64 => IM_ARCH_X86_64,
+                    mach::cputype::CPU_TYPE_ARM => IM_ARCH_ARM,
+                    mach::cputype::CPU_TYPE_ARM64 => IM_ARCH_ARM64,
+                    _ => {return None; }
+                };
+
                 for segment in &macho.segments {
                     sections.push(ImageSection {
                         name: segment.name().ok().map(|s| s.to_string()),
-                        file_offset: segment.fileoff,
+                        file_offset: macho_base as u64 + segment.fileoff,
                         size: segment.filesize,
                         virtual_address: segment.vmaddr,
-                        is_writable: segment.maxprot & VM_PROT_WRITE != 0,
-                        is_code: segment.maxprot & VM_PROT_EXECUTE != 0
+                        is_writable: segment.maxprot & mach::constants::VM_PROT_WRITE != 0,
+                        is_code: segment.maxprot & mach::constants::VM_PROT_EXECUTE != 0
                     });
                 }                
             },
@@ -162,7 +191,7 @@ impl Image<'_> {
     }
 
     pub fn rva2fo(&self, rva: u64) -> Option<u64> {
-        self.va2fo(self.base + rva as u64)
+        self.va2fo(self.base + rva)
     }
 
     pub fn fo2rva(&self, offset: u64) -> Option<u64> {
@@ -187,7 +216,7 @@ impl Image<'_> {
         None
     }
 
-    pub fn is_x64(&self) -> bool {
-        self.flags & IMAGE_FLAGS_64BIT != 0
+    pub const fn is_x64(&self) -> bool {
+        self.flags & IM_FLAGS_64BIT != 0
     }
 }
